@@ -600,6 +600,63 @@ void quantize_mmq_q8_1_cuda(
     }
 }
 
+// Each thread quantizes 4 values of one column with a scale and a sum per 32 values, columns beyond ne1 are zero.
+static __global__ void quantize_mmq_few_q8_1(
+        const float * x_ptr, void * vy_ptr, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int ne1, const int ne2) {
+    ggml_cuda_pdl_lc();
+    const float * GGML_CUDA_RESTRICT x  = x_ptr;
+    int4        * GGML_CUDA_RESTRICT vy = (int4 *) vy_ptr;
+    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+
+    if (i0 >= ne00) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    const int64_t i2 = blockIdx.z % ne2;
+    const int64_t i3 = blockIdx.z / ne2;
+    const float4  xi = (int) blockIdx.x < ne1 ? *(const float4 *) (x + i3*s03 + i2*s02 + blockIdx.x*s01 + i0) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // max. abs. value and sum of the 32 values of a sub-block, held by 8 threads
+    float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
+    float sum  = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+    }
+
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x*d_inv);
+    q.y = roundf(xi.y*d_inv);
+    q.z = roundf(xi.z*d_inv);
+    q.w = roundf(xi.w*d_inv);
+    const float d = 1.0f / d_inv;
+
+    const int s = i0 % 256 / 32;  // sub-block
+    const int k = i0 % 32;        // first value in sub-block
+    const int g = blockIdx.x % 8; // column in group
+    int4 * yg = vy + ((blockIdx.z*(ne00/256) + i0/256)*(gridDim.x/8) + blockIdx.x/8)*MMQ_FEW_Q8_1_INT4;
+    ((int *) (yg + (s/2)*MMQ_FEW_WARP_SIZE + 4*g + (k % 16)/4))[2*(s % 2) + k/16] = *(const int *) &q;
+    if (k == 0) {
+        ((half2 *) (yg + 4*MMQ_FEW_WARP_SIZE + 4*(g/2) + s/2))[2*(s % 2) + g % 2] = make_half2(d, sum);
+    }
+}
+
+void quantize_mmq_few_q8_1_cuda(
+        const float * x, void * vy, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 256 == 0);
+
+    const int64_t block_num_y = (ne00 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(GGML_PAD(ne1, 8), block_num_y, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    ggml_cuda_kernel_launch(quantize_mmq_few_q8_1, ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream),
+        x, vy, ne00, s01, s02, s03, (int) ne1, (int) ne2);
+}
+
 // scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)
 void quantize_scatter_mmq_q8_1_cuda(
         const float * x, const int32_t * ids_src1_inv, void * vy, const ggml_type type_src0,

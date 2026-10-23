@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmq-few.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -28,10 +29,6 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
         default:
             return false;
     }
-}
-
-static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
-    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
 }
 #endif
 
@@ -315,9 +312,14 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne00, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
+    }
+    // From this number of src1 columns on the few-row MMQ is faster.
+    const int mmq_few_min_ncols = ggml_cuda_mmq_few_min_ncols(type, cc, ne00);
+    if (mmq_few_min_ncols > 0) {
+        return ne11 < mmq_few_min_ncols;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
@@ -346,6 +348,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         }
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK) {
+        // For rows of a single block of 256 values most threads idle, MMQ is up to 3x faster with several columns.
+        if (ne11 > 1 && ggml_blck_size(type) == QK_K && ne00 == QK_K && ggml_cuda_should_use_mmq(type, cc, ne11, /*n_experts =*/ 0)) {
+            return false;
+        }
         switch (type) { // tuned on DGX Spark GB10
             case GGML_TYPE_Q2_K:
                 return ne11 <= 6;
@@ -756,10 +762,10 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
                     const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
-                    mmvq_prefetch_l2((const char *) vx + off);
+                    ggml_cuda_prefetch_l2((const char *) vx + off);
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            mmvq_prefetch_l2((const char *) vgate + off);
+                            ggml_cuda_prefetch_l2((const char *) vgate + off);
                         }
                     }
                 }

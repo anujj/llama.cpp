@@ -7665,6 +7665,35 @@ struct test_mul_mat_pos : public test_mul_mat {
     }
 };
 
+// a is in a buffer with the usage of model weights
+struct test_mul_mat_weights : public test_mul_mat {
+    test_mul_mat_weights(ggml_type type_a, ggml_type type_b, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, type_b, m, n, k, {1, 1}, {1, 1}) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",weights=1";
+    }
+
+    bool use_weight_context() override {
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx_weights, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 enum mul_mat_add_mode {
     MUL_MAT_ADD_MM_RES,     // mm + res
     MUL_MAT_ADD_RES_MM,     // res + mm
@@ -10968,6 +10997,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // a src1 with a nonzero mean, for the zero points and mins of quantized src0 types
         for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
+    // CUDA few-row MMQ, 1-3 MMA tiles of 8 src1 columns: broadcast batches, padded src1 rows, nonzero mean, few rows with long K, an odd number of 256 value units in K, tall matrices with a partial last tile on GPUs with up to 192 SMs, src0 in a weights buffer
+    for (int64_t n : {2, 5, 8, 9, 16, 17, 24}) {
+        for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                                 GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, n, 2048, {3, 2}, {2, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 2048, {1, 1}, {1, 1}, {0, 1, 2, 3}, 2560));
+            test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 2048, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 2304, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6170, n, 2048, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_weights(type_a, GGML_TYPE_F32, 1000, n, 2048));
         }
     }
 
