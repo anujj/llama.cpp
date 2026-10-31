@@ -649,7 +649,7 @@ static __global__ void quantize_mmq_few_q8_1(
 }
 
 void quantize_mmq_few_q8_1_cuda(
-        const float * x, void * vy, const ggml_type type_src0, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const float * x, void * vy, const mmq_q8_1_ds_layout ds_layout, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne00 % QK_K == 0);
 
@@ -657,7 +657,7 @@ void quantize_mmq_few_q8_1_cuda(
     const dim3 num_blocks(GGML_PAD(ne1, MMQ_FEW_NCOLS), block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    switch (mmq_get_q8_1_ds_layout(type_src0)) {
+    switch (ds_layout) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             ggml_cuda_kernel_launch(quantize_mmq_few_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>, launch_params,
                 x, vy, ne00, s01, s02, s03, (int) ne1, (int) ne2);

@@ -2101,11 +2101,11 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     const bool    is_id     = up->op == GGML_OP_MUL_MAT_ID;
     const int64_t ncols     = is_id ? y->ne[2]    : y->ne[1];
     const int64_t nchannels = is_id ? x_up->ne[2] : y->ne[2]*y->ne[3];
+    const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols);
     // Few-row MMQ comes first in ggml_cuda_mul_mat, so do not fuse the matmuls it takes.
     if (!is_id && ggml_cuda_should_use_mmq_few(x_up, y, cc)) {
         return false;
     }
-    const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols);
     if (use_mmvq || !ggml_cuda_should_use_mmq(x_up->type, cc, ncols, /*n_experts =*/ is_id ? x_up->ne[2] : 0)) {
         return false;
     }
@@ -2158,7 +2158,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // From a per-type number of src1 columns on, the few-row MMQ is faster than MMVQ.
+    // From a per-type number of src1 columns up to 24, the few-row MMQ is faster than MMVQ and MMQ.
     if (ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
         ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
         return;

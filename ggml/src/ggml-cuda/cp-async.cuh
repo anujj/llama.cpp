@@ -56,7 +56,7 @@ static __device__ __forceinline__ void cp_async_wait_all() {
 #endif // CP_ASYNC_AVAILABLE
 }
 
-// Groups all previously issued asynchronous copies of this thread into one group.
+// Commits the asynchronous copies of this thread issued since the last commit as one group.
 static __device__ __forceinline__ void cp_async_commit_group() {
 #ifdef CP_ASYNC_AVAILABLE
     asm volatile("cp.async.commit_group;");
