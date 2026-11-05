@@ -45,12 +45,13 @@ static __global__ void mul_mat_vec_f(
 
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
 
+    // y and dst hold float, or nv_bfloat16 for BF16 activations (fusion.y_bf16, fusion.dst_bf16)
     x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row;
-    y   += int64_t(sample_y)  *stride_sample_y   + channel_y  *stride_channel_y;
-    dst += int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
+    int64_t offset_y   = int64_t(sample_y)  *stride_sample_y   + channel_y  *stride_channel_y;
+    int64_t offset_dst = int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
     if constexpr (is_multi_token_id) {
-        y   += token_idx*stride_col_y2*2;
-        dst += token_idx*stride_col_dst;
+        offset_y   += token_idx*stride_col_y2*2;
+        offset_dst += token_idx*stride_col_dst;
     }
 
     bool use_gate = false;
@@ -97,7 +98,12 @@ static __global__ void mul_mat_vec_f(
         }
     }
 
-    const float2 * y2 = (const float2 *) y;
+    const bool y_bf16 = fusion.y_bf16;
+    const float2       * y2      = (const float2 *) (y + offset_y);
+    const nv_bfloat162 * y2_bf16 = (const nv_bfloat162 *) ((const nv_bfloat16 *) y_ptr + offset_y);
+    const auto load_y2 = [&](const int64_t i2) -> float2 {
+        return y_bf16 ? __bfloat1622float2(y2_bf16[i2]) : y2[i2];
+    };
 
     extern __shared__ char data_mmv[];
     float * buf_iw = (float *) data_mmv;
@@ -147,7 +153,7 @@ static __global__ void mul_mat_vec_f(
 
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
-                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                const float2 tmpy = load_y2(j*stride_col_y2 + col2);
                 ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
                 ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
 
@@ -179,7 +185,7 @@ static __global__ void mul_mat_vec_f(
                 }
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    const float2 tmpy = load_y2(j*stride_col_y2 + col2);
                     ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
                     ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
 
@@ -206,7 +212,7 @@ static __global__ void mul_mat_vec_f(
                 }
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    const float2 tmpy = load_y2(j*stride_col_y2 + col2);
                     sumh2[j] += tmpx * make_half2(tmpy.x, tmpy.y);
 
                     if constexpr (has_fusion) {
@@ -254,7 +260,7 @@ static __global__ void mul_mat_vec_f(
             }
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
-                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                const float2 tmpy = load_y2(j*stride_col_y2 + col2);
                 const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
                 const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
                 ggml_cuda_mad(sumf[j], tmpx0, tmpy.x);
@@ -288,7 +294,7 @@ static __global__ void mul_mat_vec_f(
             }
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
-                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                const float2 tmpy = load_y2(j*stride_col_y2 + col2);
                 ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
                 ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
 
@@ -377,7 +383,7 @@ static __global__ void mul_mat_vec_f(
         }
     }
 
-    dst[tid*stride_col_dst + row] = value;
+    ggml_cuda_store_dst(dst, offset_dst + tid*stride_col_dst + row, value, fusion.dst_bf16);
 
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, gate_bias, sumf_gate);
@@ -632,9 +638,9 @@ static void mul_mat_vec_f_cuda(
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
-    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
-    GGML_ASSERT(         dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(         dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_BF16);
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -653,13 +659,16 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
 
-    const float   * src1_d =       (const float   *) src1->data;
+    const float   * src1_d =       (const float   *) src1->data; // nv_bfloat16 if fusion_local.y_bf16
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
-    float         *  dst_d =       (float         *)  dst->data;
+    float         *  dst_d =       (float         *)  dst->data; // nv_bfloat16 if fusion_local.dst_bf16
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+    fusion_local.y_bf16   = src1->type == GGML_TYPE_BF16;
+    fusion_local.dst_bf16 = dst->type  == GGML_TYPE_BF16;
 
     if (fusion) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
         GGML_ASSERT( !ids || dst->ne[2] == 1);
         GGML_ASSERT(  ids || dst->ne[1] == 1);
         if (fusion->x_bias) {

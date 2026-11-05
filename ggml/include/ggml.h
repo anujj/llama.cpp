@@ -1500,6 +1500,13 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // same as ggml_mul_mat, but the result is stored as type (GGML_TYPE_F32 or GGML_TYPE_BF16)
+    GGML_API struct ggml_tensor * ggml_mul_mat_typed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            enum ggml_type        type);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
@@ -1524,6 +1531,14 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // same as ggml_mul_mat_id, but the result is stored as type (GGML_TYPE_F32 or GGML_TYPE_BF16)
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_typed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            enum ggml_type        type);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

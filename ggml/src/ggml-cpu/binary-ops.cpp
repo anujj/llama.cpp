@@ -127,6 +127,8 @@ static void binary_op(const ggml_compute_params * params, ggml_tensor * dst) {
         apply_binary_op<op, ggml_bf16_t, float, ggml_bf16_t>(params, dst);
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32  && dst->type == GGML_TYPE_F32) {
         apply_binary_op<op, ggml_bf16_t, float, float>(params, dst);
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16  && dst->type == GGML_TYPE_F32) {
+        apply_binary_op<op, float, ggml_bf16_t, float>(params, dst);
     } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F32  && dst->type == GGML_TYPE_F16) {
         apply_binary_op<op, ggml_fp16_t, float, ggml_fp16_t>(params, dst);
     } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F32  && dst->type == GGML_TYPE_F32) {

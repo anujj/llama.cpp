@@ -1254,7 +1254,11 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    if (dst->type == GGML_TYPE_BF16) {
+                        ggml_cpu_fp32_to_bf16(tmp + (cn * 16), (ggml_bf16_t *) dst_col + iir0 + cn * nb1 / nb0, MIN(iir0 + blck_0, ir0_end) - iir0);
+                    } else {
+                        memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    }
                 }
             }
         }
@@ -1298,7 +1302,8 @@ void ggml_compute_forward_mul_mat(
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
     // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16);
+    GGML_ASSERT(nb0 == ggml_type_size(dst->type));
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
@@ -1314,7 +1319,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (!params->use_ref && src1_cont) {
+    if (!params->use_ref && src1_cont && dst->type == GGML_TYPE_F32) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1343,10 +1348,11 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer
+        // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer,
+        // or (BF16 activations) widened from BF16 to F32 on the stack and packed into vec_dot_type
         const bool widen = src1->type != GGML_TYPE_F32;
 
-        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
+        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
         GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
     #if 0
@@ -1374,8 +1380,18 @@ UseGgmlGemm1:;
 
                     if (src1->type == GGML_TYPE_F16) {
                         ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) wdata_row, ne10_block_size);
-                    } else if (src1->type == GGML_TYPE_BF16) {
+                    } else if (src1->type == GGML_TYPE_BF16 && vec_dot_type == GGML_TYPE_F32) {
                         ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) wdata_row, ne10_block_size);
+                    } else if (src1->type == GGML_TYPE_BF16) {
+                        // widen BF16 -> F32 in chunks of whole vec_dot_type blocks, then pack
+                        float tmp_f32[1024];
+                        const int64_t chunk = (1024/bs)*bs;
+                        GGML_ASSERT(chunk > 0);
+                        for (int64_t i0 = 0; i0 < ne10_block_size; i0 += chunk) {
+                            const int64_t n = MIN(chunk, ne10_block_size - i0);
+                            ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row + i0, tmp_f32, n);
+                            from_float(tmp_f32, (char *) wdata_row + (i0/bs)*nbw0, n);
+                        }
                     } else {
                         from_float((const float *) src1_row, wdata_row, ne10_block_size);
                     }
@@ -1393,7 +1409,7 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (!params->use_ref && src1->type != vec_dot_type) {
+    if (!params->use_ref && src1->type != vec_dot_type && dst->type == GGML_TYPE_F32) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1546,7 +1562,11 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
                 }
 
-                memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
+                if (dst->type == GGML_TYPE_BF16) {
+                    ggml_cpu_fp32_to_bf16(tmp, (ggml_bf16_t *) dst_col + iir0, MIN(iir0 + blck_0, ir0_end) - iir0);
+                } else {
+                    memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
+                }
             }
         }
     }
@@ -1585,7 +1605,8 @@ static void ggml_compute_forward_mul_mat_id(
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
     // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16);
+    GGML_ASSERT(nb0 == ggml_type_size(dst->type));
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
@@ -1624,7 +1645,7 @@ static void ggml_compute_forward_mul_mat_id(
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1643,9 +1664,22 @@ static void ggml_compute_forward_mul_mat_id(
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                    const char * src1_row  = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
+                    char       * wdata_row = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
+                    const int64_t n_row = (ne10_block_end - ne10_block_start) * bs;
+                    if (src1->type == GGML_TYPE_BF16) {
+                        // BF16 activations: widen to F32 in chunks of whole vec_dot_type blocks, then pack
+                        float tmp_f32[1024];
+                        const int64_t chunk = (1024/bs)*bs;
+                        GGML_ASSERT(chunk > 0);
+                        for (int64_t i0 = 0; i0 < n_row; i0 += chunk) {
+                            const int64_t n = MIN(chunk, n_row - i0);
+                            ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row + i0, tmp_f32, n);
+                            from_float(tmp_f32, wdata_row + (i0/bs)*nbw0, n);
+                        }
+                    } else {
+                        from_float((const float *) src1_row, wdata_row, n_row);
+                    }
                 }
             }
         }
@@ -1664,7 +1698,7 @@ static void ggml_compute_forward_mul_mat_id(
                 assert(i02 == -1 || (i02 >= 0 && i02 < n_as));
 
                 if (i02 == -1) {
-                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*nb0);
                     continue;
                 }
 
@@ -2940,7 +2974,8 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_SET_ROWS:
                     {
-                        if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
+                        if ((node->src[0]->type == GGML_TYPE_F16  && node->type != GGML_TYPE_F16) ||
+                            (node->src[0]->type == GGML_TYPE_BF16 && node->type != GGML_TYPE_BF16)) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;

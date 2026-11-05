@@ -410,6 +410,25 @@ llama_context::llama_context(
     cparams.pipeline_parallel = false;
     cparams.training = false;
 
+    // prototype: activations between ops in BF16 (env LLAMA_ACT_TYPE = bf16 | bf16_res32)
+    {
+        cparams.act_type    = GGML_TYPE_F32;
+        cparams.act_res_f32 = false;
+
+        const char * LLAMA_ACT_TYPE = getenv("LLAMA_ACT_TYPE");
+        if (LLAMA_ACT_TYPE) {
+            const std::string s = LLAMA_ACT_TYPE;
+            if (s == "bf16" || s == "bf16_res32") {
+                cparams.act_type    = GGML_TYPE_BF16;
+                cparams.act_res_f32 = s == "bf16_res32";
+            } else if (s != "f32") {
+                LLAMA_LOG_WARN("%s: unknown LLAMA_ACT_TYPE '%s', using f32\n", __func__, LLAMA_ACT_TYPE);
+            }
+            LLAMA_LOG_INFO("%s: activation type = %s%s\n", __func__, ggml_type_name(cparams.act_type),
+                    cparams.act_res_f32 ? " (F32 residual)" : "");
+        }
+    }
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;

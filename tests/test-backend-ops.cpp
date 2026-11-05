@@ -2802,7 +2802,15 @@ struct test_rope_set_rows : public test_case {
     const int n_ctx{512};
 
     std::string vars() override {
+        if (type_a != GGML_TYPE_F32) {
+            return VARS_TO_STR6(type, type_idx, ne_a, mode, n_dims, type_a);
+        }
         return VARS_TO_STR5(type, type_idx, ne_a, mode, n_dims);
+    }
+
+    double max_nmse_err() override {
+        // the unfused reference rounds the rope result to BF16 before the F16 cache
+        return type_a == GGML_TYPE_BF16 ? 1e-5 : 1e-7;
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -2812,15 +2820,18 @@ struct test_rope_set_rows : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    const ggml_type type_a; // type of the rope input
+
     test_rope_set_rows(ggml_type type,
             ggml_type type_idx,
             std::array<int64_t, 4> ne_a,
             int mode,
-            int n_dims = 128)
-        : type(type), type_idx(type_idx), ne_a(ne_a), mode(mode), n_dims(n_dims) {}
+            int n_dims = 128,
+            ggml_type type_a = GGML_TYPE_F32)
+        : type(type), type_idx(type_idx), ne_a(ne_a), mode(mode), n_dims(n_dims), type_a(type_a) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne_a[0], ne_a[1], ne_a[2], 1);
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, type_a, ne_a[0], ne_a[1], ne_a[2], 1);
         ggml_set_name(a, "a");
 
         const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
@@ -4724,19 +4735,24 @@ struct test_ssm_conv : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
+    const ggml_type type_b; // type of the conv weights, GGML_TYPE_COUNT -> same as type
 
     std::string vars() override {
+        if (type_b != GGML_TYPE_COUNT) {
+            return VARS_TO_STR4(type, ne_a, ne_b, type_b);
+        }
         return VARS_TO_STR3(type, ne_a, ne_b);
     }
 
     test_ssm_conv(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {10, 10, 10, 1},
-            std::array<int64_t, 4> ne_b = {3, 3, 1, 1})
-        : type(type), ne_a(ne_a), ne_b(ne_b) {}
+            std::array<int64_t, 4> ne_b = {3, 3, 1, 1},
+            ggml_type type_b = GGML_TYPE_COUNT)
+        : type(type), ne_a(ne_a), ne_b(ne_b), type_b(type_b) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
-        ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        ggml_tensor * b   = ggml_new_tensor(ctx, type_b == GGML_TYPE_COUNT ? type : type_b, 4, ne_b.data());
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
         return out;
     }
@@ -5381,6 +5397,161 @@ static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
 }
 
 // GGML_OP_MUL_MAT
+// BF16 activations: MUL_MAT with a BF16 src1 and/or a BF16 result
+struct test_mul_mat_bf16_act : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const ggml_type type_d;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, type_b, type_d, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
+                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT) &&
+                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k;
+    }
+
+    test_mul_mat_bf16_act(ggml_type type_a, ggml_type type_b, ggml_type type_d, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), type_b(type_b), type_d(type_d), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_typed(ctx, a, b, type_d);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// BF16 activations: ROPE of a BF16 tensor cast to F32 (Q for flash attention, fused on CUDA)
+struct test_rope_cast : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int mode;
+    const int n_dims;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ROPE_CAST";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, mode, n_dims);
+    }
+
+    double max_nmse_err() override {
+        // the unfused reference rounds the rope result to BF16 before the cast
+        return 1e-5;
+    }
+
+    test_rope_cast(std::array<int64_t, 4> ne, int mode, int n_dims)
+        : ne(ne), mode(mode), n_dims(n_dims) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, ne[0], ne[1], ne[2], 1);
+        ggml_set_name(a, "a");
+
+        const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, is_mrope ? ne[2]*4 : ne[2]);
+        ggml_set_name(pos, "pos");
+
+        ggml_tensor * out;
+        if (is_mrope) {
+            int sections[4] = {11, 11, 10, 0};
+            out = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections, mode, 512, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        } else {
+            out = ggml_rope_ext(ctx, a, pos, nullptr, n_dims, mode, 512, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        }
+        out = ggml_cast(ctx, out, GGML_TYPE_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> data(ggml_nelements(t));
+                for (int i = 0; i < ggml_nelements(t); i++) {
+                    data[i] = rand() % 512;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// BF16 activations: RMS_NORM + MUL by an F32 weight, optionally cast to type_out (fused on CUDA)
+struct test_rms_norm_mul_cast : public test_case {
+    const ggml_type type_x;
+    const ggml_type type_out;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_CAST";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_x, type_out, ne, eps);
+    }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    test_rms_norm_mul_cast(ggml_type type_x, ggml_type type_out, std::array<int64_t, 4> ne = {4096, 5, 4, 1}, float eps = 1e-6f)
+        : type_x(type_x), type_out(type_out), ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, type_x, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        if (out->type != type_out) {
+            out = ggml_cast(ctx, out, type_out);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -5786,6 +5957,250 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     }
 };
 
+// BF16 activations: MUL_MAT_ID with a BF16 src1 and/or a BF16 result
+struct test_mul_mat_id_bf16_act : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const ggml_type type_d;
+    const int n_mats;
+    const int n_used;
+    const bool b; // broadcast b matrix (the same input for all experts of a token)
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_a, type_b, type_d, n_mats, n_used, b, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
+                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
+                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used;
+    }
+
+    test_mul_mat_id_bf16_act(ggml_type type_a, ggml_type type_b, ggml_type type_d,
+            int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), type_b(type_b), type_d(type_d), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id_typed(ctx, as, b, ids, type_d);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// BF16 activations: an MoE FFN as built by build_moe_ffn (gate/up + optional per-expert scale, GLU, down,
+// router weights, sum of the experts), all activations BF16
+struct test_moe_ffn_bf16_act : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int n_mats;
+    const int n_used;
+    const int64_t n_tokens;
+    const bool with_scale; // per-expert F32 weight scale (NVFP4)
+    const bool w4a8;       // FP4 weights: 8-bit activations (GGML_PREC_Q8) instead of native FP4 activations
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, n_embd, n_ff, n_mats, n_used, n_tokens, with_scale, w4a8);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_FFN_BF16";
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return with_scale; }
+
+    double max_nmse_err() override {
+        // the fused kernels keep F32 where the reference rounds to BF16 between ops
+        return 5e-3;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if ((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) &&
+                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
+                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            // two chained matmuls with FP4 activations
+            return 5e-2;
+        }
+        return max_nmse_err();
+    }
+
+    test_moe_ffn_bf16_act(ggml_type type, int64_t n_embd, int64_t n_ff, int n_mats, int n_used, int64_t n_tokens, bool with_scale,
+            bool w4a8 = false)
+        : type(type), n_embd(n_embd), n_ff(n_ff), n_mats(n_mats), n_used(n_used), n_tokens(n_tokens), with_scale(with_scale),
+          w4a8(w4a8) {}
+
+    // as in build_lora_mm_id
+    ggml_tensor * build_mm_id(ggml_context * ctx, ggml_context * ctx_weights, ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids) {
+        ggml_tensor * res = ggml_mul_mat_id_typed(ctx, w, cur, ids, GGML_TYPE_BF16);
+        if (w4a8) {
+            ggml_prec_set_src(res, GGML_PREC_Q8, 1);
+        }
+        if (with_scale) {
+            ggml_tensor * w_s = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_mats);
+            ggml_tensor * s = ggml_reshape_3d(ctx, w_s, 1, n_mats, 1);
+            s = ggml_repeat_4d(ctx, s, 1, n_mats, n_tokens, 1);
+            s = ggml_get_rows(ctx, s, ids);
+            res = ggml_mul(ctx, res, s);
+        }
+        return res;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(!use_weight_context());
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * downs = ggml_new_tensor_3d(ctx, type, n_ff, n_embd, n_mats);
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+        }
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, n_embd, 1, n_tokens);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * up   = build_mm_id(ctx, ctx_weights, ups,   cur, ids);
+        ggml_tensor * gate = build_mm_id(ctx, ctx_weights, gates, cur, ids);
+        ggml_tensor * glu  = ggml_swiglu_split(ctx, gate, up);
+
+        ggml_tensor * experts = build_mm_id(ctx, ctx_weights, downs, glu, ids);
+        experts = ggml_mul(ctx, experts, weights);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, experts);
+        }
+
+        // order the views before the adds
+        std::vector<ggml_tensor *> views(n_used);
+        for (int i = 0; i < n_used; ++i) {
+            views[i] = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, views[i]);
+            }
+        }
+        ggml_tensor * out = views[0];
+        for (int i = 1; i < n_used; ++i) {
+            out = ggml_add(ctx, out, views[i]);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, out);
+            }
+        }
+        ggml_set_name(out, "moe_out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// Dense FFN with BF16 activations as in build_ffn: up and gate MUL_MATs (optional per-tensor NVFP4 weight scale), SWIGLU, down
+struct test_ffn_bf16_act : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int64_t n_tokens;
+    const bool with_scale; // per-tensor F32 weight scale (NVFP4)
+    const bool w4a8;       // FP4 weights: 8-bit activations (GGML_PREC_Q8) instead of native FP4 activations
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, n_embd, n_ff, n_tokens, with_scale, w4a8);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FFN_BF16";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        // the fused kernels keep F32 where the reference rounds to BF16 between ops
+        return 5e-3;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (type == GGML_TYPE_NVFP4 && !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT) &&
+                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            // two chained matmuls with FP4 activations
+            return 5e-2;
+        }
+        return max_nmse_err();
+    }
+
+    test_ffn_bf16_act(ggml_type type, int64_t n_embd, int64_t n_ff, int64_t n_tokens, bool with_scale, bool w4a8 = false)
+        : type(type), n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens), with_scale(with_scale), w4a8(w4a8) {}
+
+    // as in build_lora_mm
+    ggml_tensor * build_mm(ggml_context * ctx, ggml_tensor * w, ggml_tensor * cur) {
+        ggml_tensor * res = ggml_mul_mat_typed(ctx, w, cur, GGML_TYPE_BF16);
+        if (w4a8) {
+            ggml_prec_set_src(res, GGML_PREC_Q8, 1);
+        }
+        if (with_scale) {
+            ggml_tensor * w_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            res = ggml_mul(ctx, res, w_s);
+        }
+        return res;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ups   = ggml_new_tensor_2d(ctx, type, n_embd, n_ff);
+        ggml_tensor * gates = ggml_new_tensor_2d(ctx, type, n_embd, n_ff);
+        ggml_tensor * downs = ggml_new_tensor_2d(ctx, type, n_ff, n_embd);
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n_embd, n_tokens);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * up   = build_mm(ctx, ups,   cur);
+        ggml_tensor * gate = build_mm(ctx, gates, cur);
+        ggml_tensor * glu  = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * out  = build_mm(ctx, downs, glu);
+        ggml_set_name(out, "ffn_out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -5871,19 +6286,20 @@ struct test_mul_mat_id_fusion : public test_case {
 struct test_mul_mat_id_shared : public test_case {
     const ggml_type type;
     const int64_t n;
+    const ggml_type type_act; // activations (input, matmul results), F32 or BF16
     ggml_tensor * routed = nullptr;
     ggml_tensor * shared = nullptr;
 
-    test_mul_mat_id_shared(ggml_type type, int64_t n) : type(type), n(n) {}
+    test_mul_mat_id_shared(ggml_type type, int64_t n, ggml_type type_act = GGML_TYPE_F32) : type(type), n(n), type_act(type_act) {}
 
-    std::string vars() override { return VARS_TO_STR2(type, n); }
+    std::string vars() override { return type_act == GGML_TYPE_F32 ? VARS_TO_STR2(type, n) : VARS_TO_STR3(type, n, type_act); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { routed, shared }; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, n);
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, type_act, 512, n);
         ggml_tensor * input_ids = ggml_reshape_3d(ctx, input, 512, 1, n);
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, n);
         ggml_set_name(ids, "ids");
@@ -5891,8 +6307,10 @@ struct test_mul_mat_id_shared : public test_case {
         ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
         ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type, 512, 128);
         ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type, 512, 128);
-        routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
-        shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, input), ggml_mul_mat(ctx, shared_up, input));
+        routed = ggml_swiglu_split(ctx, ggml_mul_mat_id_typed(ctx, gate, input_ids, ids, type_act),
+                                        ggml_mul_mat_id_typed(ctx, up, input_ids, ids, type_act));
+        shared = ggml_swiglu_split(ctx, ggml_mul_mat_typed(ctx, shared_gate, input, type_act),
+                                        ggml_mul_mat_typed(ctx, shared_up, input, type_act));
         return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, 128, 1, n));
     }
 
@@ -7743,16 +8161,27 @@ struct test_moe_reduce : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const ggml_type type; // experts, products and sums: F32, or BF16 for BF16 activations
 
     test_moe_reduce(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false,
+            ggml_type type = GGML_TYPE_F32) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), type(type) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        std::string v = VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        if (type != GGML_TYPE_F32) {
+            v += "," + VAR_TO_STR(type);
+        }
+        return v;
+    }
+
+    double max_nmse_err() override {
+        // the fused BF16 kernel sums in F32 and rounds once, the reference rounds every product and sum
+        return type == GGML_TYPE_F32 ? 1e-7 : 1e-4;
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7765,13 +8194,14 @@ struct test_moe_reduce : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * experts;
         if (unaligned_experts) {
+            const size_t ts = ggml_type_size(type);
             ggml_tensor * storage = ggml_new_tensor_1d(
-                ctx, GGML_TYPE_F32, n_embd * n_expert_used * n_tokens + 1);
+                ctx, type, n_embd * n_expert_used * n_tokens + 1);
             ggml_set_name(storage, "experts_storage");
             experts = ggml_view_3d(ctx, storage, n_embd, n_expert_used, n_tokens,
-                n_embd * sizeof(float), n_embd * n_expert_used * sizeof(float), sizeof(float));
+                n_embd * ts, n_embd * n_expert_used * ts, ts);
         } else {
-            experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens);
+            experts = ggml_new_tensor_3d(ctx, type, n_embd, n_expert_used, n_tokens);
         }
         ggml_set_name(experts, "experts");
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
@@ -8780,9 +9210,14 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const ggml_type type_Q;
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        std::string s = VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        if (type_Q != GGML_TYPE_F32) {
+            s += ",type_Q=" + std::string(ggml_type_name(type_Q));
+        }
+        return s;
     }
 
     double max_nmse_err() override {
@@ -8799,9 +9234,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, ggml_type type_Q = GGML_TYPE_F32)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), type_Q(type_Q) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8826,7 +9261,7 @@ struct test_flash_attn_ext : public test_case {
             return t;
         };
 
-        ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
+        ggml_tensor * q = create_permuted(type_Q, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
         ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], kv_view); // the K tensor is usually a view of the K cache
@@ -10511,6 +10946,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rope_set_rows(type, GGML_TYPE_I64, { 256, 4, 8, 1 }, mode, 64));
         }
     }
+
+    // BF16 activations: rope written to an F16 KV cache
+    for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE }) {
+        for (int ne2 : {1, 8, 512}) {
+            test_cases.emplace_back(new test_rope_set_rows(GGML_TYPE_F16, GGML_TYPE_I64, { 128, 32, ne2, 1 }, mode, 128, GGML_TYPE_BF16));
+        }
+    }
+
 
     for (ggml_type type_input : {GGML_TYPE_F32}) {
         for (ggml_op_pool pool_type : {GGML_OP_POOL_AVG, GGML_OP_POOL_MAX}) {
@@ -12896,6 +13339,121 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // BF16 activations
+    // MUL_MAT: n <= 8 MMVQ/MMVF, larger n MMQ (m = 1024, k = 2048: stream-k with fixup) or cuBLAS
+    for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (auto [type_b, type_d] : { std::pair{GGML_TYPE_BF16, GGML_TYPE_BF16}, std::pair{GGML_TYPE_BF16, GGML_TYPE_F32}, std::pair{GGML_TYPE_F32, GGML_TYPE_BF16} }) {
+            for (int64_t n : {1, 3, 8, 64, 512}) {
+                test_cases.emplace_back(new test_mul_mat_bf16_act(type_a, type_b, type_d, 1024, n, 2048));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_bf16_act(GGML_TYPE_NVFP4, GGML_TYPE_BF16, GGML_TYPE_BF16, 4096, 2048, 4096));
+    test_cases.emplace_back(new test_mul_mat_bf16_act(GGML_TYPE_Q8_0,  GGML_TYPE_BF16, GGML_TYPE_BF16, 1000, 77,   1024));
+    // float weights with few rows (router, shared expert gate): MMVF or cuBLAS
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        for (auto [type_b, type_d] : { std::pair{GGML_TYPE_BF16, GGML_TYPE_BF16}, std::pair{GGML_TYPE_BF16, GGML_TYPE_F32} }) {
+            for (int64_t n : {1, 2, 64}) {
+                test_cases.emplace_back(new test_mul_mat_bf16_act(type_a, type_b, type_d, 256, n, 2048));
+                test_cases.emplace_back(new test_mul_mat_bf16_act(type_a, type_b, type_d, 1,   n, 2048));
+            }
+        }
+    }
+
+    // MUL_MAT_ID: n <= 8 MMVQ (MoE kernel for n > 1), larger n MMQ (n = 512: stream-k with fixup), float weights: generic path
+    for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_BF16}) {
+        for (auto [type_b, type_d] : { std::pair{GGML_TYPE_BF16, GGML_TYPE_BF16}, std::pair{GGML_TYPE_BF16, GGML_TYPE_F32}, std::pair{GGML_TYPE_F32, GGML_TYPE_BF16} }) {
+            for (int64_t n : {1, 4, 64}) {
+                test_cases.emplace_back(new test_mul_mat_id_bf16_act(type_a, type_b, type_d, 16, 4, true,  512, n, 1024));
+            }
+            test_cases.emplace_back(new test_mul_mat_id_bf16_act(type_a, type_b, type_d, 16, 4, false, 512, 4, 1024));
+        }
+    }
+    for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat_id_bf16_act(type_a, GGML_TYPE_BF16, GGML_TYPE_BF16, 64, 8, true,  768, 512, 2048));
+        test_cases.emplace_back(new test_mul_mat_id_bf16_act(type_a, GGML_TYPE_BF16, GGML_TYPE_BF16, 64, 8, false, 2048, 512, 768));
+    }
+
+    // MoE FFN: fused gate/up/GLU (MMVQ, MMQ), per-expert scale, weighted sum of the experts, shared expert
+    for (int64_t n_tokens : {1, 4, 33}) {
+        test_cases.emplace_back(new test_moe_ffn_bf16_act(GGML_TYPE_NVFP4, 512, 256, 16, 4, n_tokens, true));
+        test_cases.emplace_back(new test_moe_ffn_bf16_act(GGML_TYPE_Q4_K,  512, 256, 16, 4, n_tokens, false));
+    }
+    test_cases.emplace_back(new test_moe_ffn_bf16_act(GGML_TYPE_NVFP4, 512,  256, 16, 4, 33,  true, true));
+    test_cases.emplace_back(new test_moe_ffn_bf16_act(GGML_TYPE_NVFP4, 2048, 768, 64, 8, 512, true));
+    test_cases.emplace_back(new test_moe_ffn_bf16_act(GGML_TYPE_NVFP4, 2048, 768, 64, 8, 512, true, true));
+    test_cases.emplace_back(new test_moe_ffn_bf16_act(GGML_TYPE_Q4_K,  2048, 768, 64, 8, 512, false));
+    // Dense FFN: fused gate/up/GLU with the NVFP4 weight scales (MMVQ for few tokens, MMQ otherwise)
+    for (int64_t n_tokens : {1, 4, 150, 512}) {
+        test_cases.emplace_back(new test_ffn_bf16_act(GGML_TYPE_NVFP4, 256, 6912, n_tokens, true));
+        test_cases.emplace_back(new test_ffn_bf16_act(GGML_TYPE_NVFP4, 256, 6912, n_tokens, true, true));
+        test_cases.emplace_back(new test_ffn_bf16_act(GGML_TYPE_Q4_K,  256, 6912, n_tokens, false));
+    }
+    test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, false, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true,  false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true,  true,  GGML_TYPE_BF16));
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+        for (int64_t n : { 1, 2, 4, 9 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n, GGML_TYPE_BF16));
+        }
+    }
+
+    // RMS_NORM, RMS_NORM + MUL (+ cast)
+    for (bool v : {false, true}) {
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, {4096, 5, 4, 1}, v, 1e-6f));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, {256, 24, 8, 1}, v, 1e-6f));
+    }
+    for (auto [type_x, type_out] : { std::pair{GGML_TYPE_BF16, GGML_TYPE_BF16}, std::pair{GGML_TYPE_F32, GGML_TYPE_BF16} }) {
+        test_cases.emplace_back(new test_rms_norm_mul_cast(type_x, type_out, {4096, 5, 4, 1}));
+        test_cases.emplace_back(new test_rms_norm_mul_cast(type_x, type_out, {5120, 1, 1, 1}));
+        test_cases.emplace_back(new test_rms_norm_mul_cast(type_x, type_out, {256, 24, 8, 1}));
+    }
+
+    // ROPE
+    for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX }) {
+        test_cases.emplace_back(new test_rope(GGML_TYPE_BF16, {128, 32, 4, 1}, 128, mode));
+        test_cases.emplace_back(new test_rope(GGML_TYPE_BF16, {128, 32, 4, 1}, 64, mode));
+    }
+    {
+        // qwen3.5-style interleaved mrope, 256 head size, partial rotation
+        test_cases.emplace_back(new test_rope(GGML_TYPE_BF16, {256, 24, 8, 1}, 64, GGML_ROPE_TYPE_IMROPE));
+        test_cases.emplace_back(new test_rope(GGML_TYPE_BF16, {128, 16, 8, 1}, 128, GGML_ROPE_TYPE_MROPE));
+    }
+
+    // ROPE + cast to F32
+    for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE }) {
+        for (int64_t ne2 : {1, 7, 512}) {
+            test_cases.emplace_back(new test_rope_cast({128, 32, ne2, 1}, mode, 128));
+            test_cases.emplace_back(new test_rope_cast({256, 24, ne2, 1}, mode, 64));
+        }
+    }
+
+    // SET_ROWS from BF16
+    for (ggml_type type_dst : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_BF16, type_dst, GGML_TYPE_I64, {128, 32, 4, 1}, {1, 1}, 7, false));
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_BF16, type_dst, GGML_TYPE_I32, {512, 16, 2, 1}, {1, 1}, 3, true));
+    }
+
+    // F32 residual + BF16 branch, F32 attention output * BF16 gate
+    for (auto op : {ggml_add, ggml_mul}) {
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {5120, 5, 1, 1}, {1, 1, 1, 1}, 1, false, false, GGML_TYPE_BF16));
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {10, 5, 4, 3}, {2, 2, 2, 2}, 1, false, false, GGML_TYPE_BF16));
+    }
+
+    // SSM_CONV with BF16 conv_x and F32 weights
+    for (int64_t n_t : {1, 32, 100}) {
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_BF16, {3 + n_t, 1024, 1, 1}, {4, 1024, 1, 1}, GGML_TYPE_F32));
+    }
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_BF16, {3 + 16, 1536, 2, 1}, {4, 1536, 1, 1}, GGML_TYPE_F32));
+
+    // FLASH_ATTN_EXT with BF16 Q
+    for (int64_t nb : {1, 3, 64}) {
+        for (int64_t hs : {128, 256}) {
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, 512, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, GGML_TYPE_BF16));
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -12905,6 +13463,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // BF16 activations: MoE expert matmuls of Qwen3.6-35B-A3B (up/gate: shared input, down: one input per expert)
+    for (auto [type_b, type_d] : { std::pair{GGML_TYPE_F32, GGML_TYPE_F32}, std::pair{GGML_TYPE_BF16, GGML_TYPE_F32},
+                                   std::pair{GGML_TYPE_F32, GGML_TYPE_BF16}, std::pair{GGML_TYPE_BF16, GGML_TYPE_BF16} }) {
+        test_cases.emplace_back(new test_mul_mat_id_bf16_act(GGML_TYPE_NVFP4, type_b, type_d, 256, 8, true,  512,  2048, 2048));
+        test_cases.emplace_back(new test_mul_mat_id_bf16_act(GGML_TYPE_NVFP4, type_b, type_d, 256, 8, false, 2048, 2048, 512));
+    }
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));

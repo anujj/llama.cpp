@@ -1658,13 +1658,32 @@ ggml_tensor * llm_graph_context::build_hadamard_input(
     return x;
 }
 
+ggml_type llm_graph_context::act_type_mm(const ggml_tensor * w) const {
+    // the output head writes F32 logits
+    if (cparams.act_type == GGML_TYPE_F32 || strcmp(w->name, "output.weight") == 0 || strcmp(w->name, "token_embd.weight") == 0) {
+        return GGML_TYPE_F32;
+    }
+    return cparams.act_type;
+}
+
+ggml_tensor * llm_graph_context::build_residual(
+         ggml_tensor * cur,
+         ggml_tensor * inp) const {
+    // with an F32 residual stream the F32 operand goes first, so that the sum stays F32
+    if (cparams.act_res_f32 && inp->type == GGML_TYPE_F32 && cur->type != GGML_TYPE_F32) {
+        return ggml_add(ctx0, inp, cur);
+    }
+    return ggml_add(ctx0, cur, inp);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+            ggml_type   type) const {
     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
+    ggml_tensor * res = ggml_mul_mat_typed(ctx0, w, cur_mm, type != GGML_TYPE_COUNT ? type : act_type_mm(w));
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -1741,13 +1760,15 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s,
-          ggml_tensor * slots) const {
+          ggml_tensor * slots,
+            ggml_type   type) const {
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+    const ggml_type type_res = type != GGML_TYPE_COUNT ? type : act_type_mm(w);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
-        ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+        ggml_mul_mat_id_typed(ctx0, w, cur_mm, ids, type_res) :
+        ggml_mul_mat_id_typed(ctx0, moe_cache->get_experts(w), cur_mm, slots, type_res);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -1818,6 +1839,11 @@ ggml_tensor * llm_graph_context::build_norm(
 
     if (mb) {
         cur = ggml_add(ctx0, cur, mb);
+    }
+
+    // BF16 activations: an F32 input (F32 residual stream, GDN output) gives a BF16 result
+    if (cparams.act_type != GGML_TYPE_F32 && cur->type == GGML_TYPE_F32) {
+        cur = ggml_cast(ctx0, cur, cparams.act_type);
     }
 
     return cur;
@@ -2258,7 +2284,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
-        logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
+        // the router logits stay F32 for the expert selection
+        logits = build_lora_mm(gate_inp, cur, nullptr, GGML_TYPE_F32); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
@@ -2825,6 +2852,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         cur = ggml_mul(ctx0, cur, inp->scale_rows);
     }
 
+    if (cparams.act_type != GGML_TYPE_F32 && !cparams.act_res_f32) {
+        cur = ggml_cast(ctx0, cur, cparams.act_type);
+    }
+
     cb(cur, "embd", -1);
 
     res->add_input(std::move(inp));
@@ -3275,6 +3306,11 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (inp->self_v_rot[il]) {
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot[il]);
+    }
+
+    // BF16 activations: flash attention reads an F32 Q (CUDA fuses the cast into the rope)
+    if (q_cur->type == GGML_TYPE_BF16 && cparams.flash_attn) {
+        q_cur = ggml_cast(ctx0, q_cur, GGML_TYPE_F32);
     }
 
     // these nodes are added to the graph together so that they are not reordered

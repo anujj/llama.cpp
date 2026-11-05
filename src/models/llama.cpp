@@ -175,7 +175,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+        ggml_tensor * ffn_inp = build_residual(cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
         // feed-forward network (non-MoE)
@@ -217,7 +217,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     model.layers[il].ffn_down_exps_s);
             cb(cur, "ffn_moe_out", il);
         }
-        cur = ggml_add(ctx0, cur, ffn_inp);
+        cur = build_residual(cur, ffn_inp);
         cb(cur, "ffn_out", il);
 
         cur = build_cvec(cur, il);

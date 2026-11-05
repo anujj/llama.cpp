@@ -418,6 +418,8 @@ static void ggml_cuda_op_bin_bcast(
 
     if (src0->type == GGML_TYPE_F32 && src1->type != GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
         op()(src0, src1, dst, (const float *)src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
+        op()(src0, src1, dst, (const float *) src0_dd, (const nv_bfloat16 *) src1_dd, (float *) dst_dd, stream);
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
         op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const nv_bfloat16 *) src1_dd, (nv_bfloat16 *) dst_dd, stream);
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
@@ -465,6 +467,10 @@ static void ggml_cuda_op_fused_binbcast_impl(ggml_backend_cuda_context & ctx, gg
     if (src0->type == GGML_TYPE_F32 && src1->type != GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
         launch_bin_bcast_pack<op, float, float, float>(src0, src1, dst,
             (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
+            stream, std::make_index_sequence<n_fuse>{});
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
+        launch_bin_bcast_pack<op, float, nv_bfloat16, float>(src0, src1, dst,
+            (const float *) src0->data, (const nv_bfloat16 *) src1->data, (float *) dst->data,
             stream, std::make_index_sequence<n_fuse>{});
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
         launch_bin_bcast_pack<op, nv_bfloat16, nv_bfloat16, nv_bfloat16>(src0, src1, dst,

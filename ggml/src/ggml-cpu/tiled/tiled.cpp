@@ -1213,6 +1213,10 @@ bool ggml_compute_forward_mul_mat_tiled(
     if (params->use_ref) {
         return false;
     }
+    // F32 src1 and dst only
+    if (dst->type != GGML_TYPE_F32 || dst->src[1]->type == GGML_TYPE_BF16) {
+        return false;
+    }
     if (!ggml_tiled_supported(dst->src[0], dst->src[1])) {
         return false;
     }
@@ -1232,6 +1236,10 @@ bool ggml_compute_forward_mul_mat_id_tiled(
         const int32_t *                    expert_rows,
         char *                             scratch) {
     if (params->use_ref) {
+        return false;
+    }
+    // F32 src1 and dst only
+    if (dst->type != GGML_TYPE_F32 || dst->src[1]->type == GGML_TYPE_BF16) {
         return false;
     }
     if (!ggml_tiled_supported(dst->src[0], dst->src[1])) {

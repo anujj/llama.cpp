@@ -1002,7 +1002,7 @@ void launch_fattn(
 
     ggml_tensor * KQV = dst;
 
-    GGML_ASSERT(Q->type == GGML_TYPE_F32);
+    GGML_ASSERT(Q->type == GGML_TYPE_F32 || Q->type == GGML_TYPE_BF16);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
 
     GGML_ASSERT(Q->nb[0] == ggml_element_size(Q));
@@ -1019,6 +1019,24 @@ void launch_fattn(
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+
+    // the kernels read F32 Q: a BF16 Q is converted to a contiguous F32 copy
+    // (allocated before the other pool buffers: the pool frees in LIFO order)
+    const char * Q_data = (const char *) Q->data;
+    size_t nbq1 = Q->nb[1];
+    size_t nbq2 = Q->nb[2];
+    size_t nbq3 = Q->nb[3];
+    ggml_cuda_pool_alloc<float> Q_f32(pool);
+    if (Q->type == GGML_TYPE_BF16) {
+        Q_f32.alloc(ggml_nelements(Q));
+        const size_t ts = ggml_type_size(Q->type);
+        ggml_get_to_fp32_nc_cuda(Q->type)(Q->data, Q_f32.ptr, Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+            Q->nb[1]/ts, Q->nb[2]/ts, Q->nb[3]/ts, main_stream);
+        Q_data = (const char *) Q_f32.ptr;
+        nbq1 = Q->ne[0]*sizeof(float);
+        nbq2 = Q->ne[1]*nbq1;
+        nbq3 = Q->ne[2]*nbq2;
+    }
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
@@ -1261,7 +1279,7 @@ void launch_fattn(
 
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
-        (const char *) Q->data,
+        Q_data,
         K_data,
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
@@ -1270,7 +1288,7 @@ void launch_fattn(
         kv_rows ? (const int *) kv_rows->data : nullptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-        Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+        Q->ne[0], ne01,     Q->ne[2], Q->ne[3], nbq1, nbq2, nbq3,
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,

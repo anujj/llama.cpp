@@ -1117,19 +1117,31 @@ struct llm_graph_context {
               ggml_tensor * cur) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
+    // type: result type, GGML_TYPE_COUNT = the activation type (cparams.act_type, F32 for the output head)
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s  = nullptr,
+                ggml_type   type = GGML_TYPE_COUNT) const;
+
+    // result type of a matmul with weight w for the current activation type
+    ggml_type act_type_mm(const ggml_tensor * w) const;
+
+    // residual connection cur + inp, keeps an F32 residual stream F32 (cparams.act_res_f32)
+    ggml_tensor * build_residual(
+              ggml_tensor * cur,
+              ggml_tensor * inp) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
+    // type: result type, GGML_TYPE_COUNT = the activation type
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * slots = nullptr,
+                ggml_type   type  = GGML_TYPE_COUNT) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range

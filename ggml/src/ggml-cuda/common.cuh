@@ -1602,7 +1602,19 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    bool dst_bf16 = false;    // dst holds nv_bfloat16 instead of float
+    bool x_bias_bf16 = false; // x_bias holds nv_bfloat16 (e.g. a BF16 residual), same layout as dst
+    bool y_bf16 = false;      // MMVF: y holds nv_bfloat16 instead of float
 };
+
+// store one result element to a dst that holds either float or nv_bfloat16
+static __device__ __forceinline__ void ggml_cuda_store_dst(void * dst, const int64_t i, const float v, const bool dst_bf16) {
+    if (dst_bf16) {
+        ((nv_bfloat16 *) dst)[i] = __float2bfloat16(v);
+    } else {
+        ((float *) dst)[i] = v;
+    }
+}
 
 struct ggml_cuda_kernel_launch_params {
     dim3 block_nums;

@@ -15,8 +15,14 @@ typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, const ch
     const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
-    float * __restrict__ dst, const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max,
-    const ggml_glu_op glu_op, const float glu_limit, const float * __restrict__ x_scale, const float * __restrict__ gate_scale);
+    void * __restrict__ dst, const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max,
+    const ggml_glu_op glu_op, const float glu_limit, const float * __restrict__ x_scale, const float * __restrict__ gate_scale,
+    const bool dst_bf16);
+
+// dst + i elements, dst holds either float or nv_bfloat16
+static __device__ __forceinline__ void * ggml_cuda_mmq_dst_ptr(void * dst, const int64_t i, const bool dst_bf16) {
+    return (char *) dst + i*(dst_bf16 ? sizeof(nv_bfloat16) : sizeof(float));
+}
 
 enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,
@@ -461,9 +467,10 @@ static __device__ __forceinline__ const block_t * ggml_cuda_mmq_x_row(
 #include "mmq-vec-dot.cuh"
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
-        const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
+        const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, void * __restrict__ dst,
         const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max,
-        const ggml_glu_op glu_op, const float glu_limit, const float * __restrict__ x_scale, const float * __restrict__ gate_scale) {
+        const ggml_glu_op glu_op, const float glu_limit, const float * __restrict__ x_scale, const float * __restrict__ gate_scale,
+        const bool dst_bf16) {
     GGML_UNUSED_VARS(glu_op, glu_limit, x_scale, gate_scale);
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -491,12 +498,12 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
 
             if constexpr (type == GGML_TYPE_NVFP4) {
                 if (y_scale_used) {
-                    dst[ids_dst[j]*stride + i] = y_scale[j] * sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
+                    ggml_cuda_store_dst(dst, ids_dst[j]*stride + i, y_scale[j] * sum[(j0/nwarps) * (I/warp_size) + i0/warp_size], dst_bf16);
                 } else {
-                    dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
+                    ggml_cuda_store_dst(dst, ids_dst[j]*stride + i, sum[(j0/nwarps) * (I/warp_size) + i0/warp_size], dst_bf16);
                 }
             } else {
-                dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
+                ggml_cuda_store_dst(dst, ids_dst[j]*stride + i, sum[(j0/nwarps) * (I/warp_size) + i0/warp_size], dst_bf16);
                 GGML_UNUSED(y_scale_used);
             }
         }
@@ -507,9 +514,10 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
 // x_scale/gate_scale: optional NVFP4 scales of the up and gate weights (per tensor, or of the expert of this tile).
 template<ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
 static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
-            const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
+            const float * __restrict__ sum, const int * __restrict__ ids_dst, void * __restrict__ dst,
             const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max,
-            const ggml_glu_op glu_op, const float glu_limit, const float * __restrict__ x_scale, const float * __restrict__ gate_scale) {
+            const ggml_glu_op glu_op, const float glu_limit, const float * __restrict__ x_scale, const float * __restrict__ gate_scale,
+            const bool dst_bf16) {
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
@@ -560,15 +568,15 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
                         up   *= scale_up;
                         gate *= scale_gate;
                     }
-                    dst[ids_dst[j]*stride + i] = ggml_cuda_op_glu_single(glu_op, gate, up, glu_limit);
+                    ggml_cuda_store_dst(dst, ids_dst[j]*stride + i, ggml_cuda_op_glu_single(glu_op, gate, up, glu_limit), dst_bf16);
                 } else if constexpr (type == GGML_TYPE_NVFP4) {
                     if (y_scale_used) {
-                        dst[ids_dst[j]*stride + i] = y_scale[j] * sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                        ggml_cuda_store_dst(dst, ids_dst[j]*stride + i, y_scale[j] * sum[(j0/tile_C::J + n)*tile_C::ne + l], dst_bf16);
                     } else {
-                        dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                        ggml_cuda_store_dst(dst, ids_dst[j]*stride + i, sum[(j0/tile_C::J + n)*tile_C::ne + l], dst_bf16);
                     }
                 } else {
-                    dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                    ggml_cuda_store_dst(dst, ids_dst[j]*stride + i, sum[(j0/tile_C::J + n)*tile_C::ne + l], dst_bf16);
                     GGML_UNUSED(y_scale_used);
                 }
             }
@@ -933,11 +941,11 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1, bool has_fusion>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int offset_x, const int * __restrict__ y,
-        const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int * __restrict__ ids_dst, void * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale, const ggml_glu_op glu_op, const float glu_limit,
         const float * __restrict__ x_scale, const float * __restrict__ gate_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const bool dst_bf16) {
     static_assert(!(fixup && has_fusion), "the fused gate/up path does not split K");
     static_assert(!(fallback && has_fusion), "the fused gate/up path needs nrows_x % 128 == 0");
 
@@ -1005,9 +1013,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 
     if (fixup) {
-        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J, glu_op, glu_limit, x_scale, gate_scale);
+        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J, glu_op, glu_limit, x_scale, gate_scale, false);
     } else {
-        write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j, glu_op, glu_limit, x_scale, gate_scale);
+        write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j, glu_op, glu_limit, x_scale, gate_scale, dst_bf16);
     }
 }
 
@@ -1018,13 +1026,13 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fu
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
-        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int32_t * __restrict__ expert_bounds, void * __restrict__ dst, float * __restrict__ tmp_fixup, float * __restrict__ tmp_first,
         const float * __restrict__ y_scale, const ggml_glu_op glu_op, const float glu_limit,
         const float * __restrict__ x_scale, const float * __restrict__ gate_scale,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const bool dst_bf16) {
 
 #ifdef TURING_MMA_AVAILABLE
     constexpr bool fusion_available = true;
@@ -1139,9 +1147,9 @@ static __global__ void mul_mat_q(
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, has_fusion>
-            (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+            (x, x_gate, offset_x, y + offset_y, ids_dst_shared, ggml_cuda_mmq_dst_ptr(dst, offset_dst, dst_bf16), tmp_fixup, y_scale_tile,
              glu_op, glu_limit, x_scale_tile, gate_scale_tile, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, dst_bf16);
         return;
     }
 
@@ -1204,6 +1212,9 @@ static __global__ void mul_mat_q(
                 continue;
             }
 
+            // a partial tile for tmp_first (BF16 dst) has the contiguous layout of the fixup buffer
+            const bool ids_identity = dst_bf16 && kb0_start != 0;
+
             __syncthreads();
 #pragma unroll
             for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
@@ -1213,7 +1224,7 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                ids_dst_shared[j] = ids_identity ? j : ids_dst[col_low + jt*J + j];
             }
             __syncthreads();
         }
@@ -1232,10 +1243,19 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, false>
-            (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
-             glu_op, glu_limit, x_scale, gate_scale, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+        if (dst_bf16 && kb0_start != 0) {
+            // BF16 dst: the partial sum of a tile started by previous blocks goes to tmp_first in F32,
+            // the fixup kernel adds all partial sums and rounds once
+            mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, false>
+                (x, x_gate, offset_x, y + offset_y, ids_dst_shared, tmp_first + blockIdx.x*(J*I), tmp_fixup, y_scale_tile,
+                 glu_op, glu_limit, x_scale, gate_scale, stride_row_x, ncols_y, /*stride_col_dst =*/ I,
+                 tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, /*dst_bf16 =*/ false);
+        } else {
+            mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, false>
+                (x, x_gate, offset_x, y + offset_y, ids_dst_shared, ggml_cuda_mmq_dst_ptr(dst, offset_dst, dst_bf16), tmp_fixup, y_scale_tile,
+                 glu_op, glu_limit, x_scale, gate_scale, stride_row_x, ncols_y, stride_col_dst,
+                 tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, dst_bf16);
+        }
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1317,18 +1337,21 @@ static __global__ void mul_mat_q(
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, false>
-        (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+        (x, x_gate, offset_x, y + offset_y, ids_dst_shared, ggml_cuda_mmq_dst_ptr(dst, offset_dst, dst_bf16), tmp_fixup, y_scale_tile,
          glu_op, glu_limit, x_scale, gate_scale, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, dst_bf16);
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
-        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
-        float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
+        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, void * __restrict__ dst_ptr,
+        float * __restrict__ tmp_last_tile, const float * __restrict__ tmp_first_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
-        const int stride_sample_dst, const uint3 ntx) {
+        const int stride_sample_dst, const uint3 ntx, const bool dst_bf16) {
+    // F32 dst: add the partial sums of the previous blocks to dst
+    // BF16 dst: the block's own partial sum is in tmp_first_tile, the total is rounded and written once
+    float * dst = (float *) dst_ptr;
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
@@ -1358,6 +1381,15 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 
     bool any_fixup = false;
+
+    if (dst_bf16) {
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+            sum[j0/nwarps] += tmp_first_tile[bidx0*(J*I) + j*I + i];
+        }
+    }
 
     // Iterate over previous blocks and sum up partial sums written to fixup buffer.
     // All CUDA blocks that get here must have a previous block that needs a fixup.
@@ -1391,7 +1423,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
         kbc_stop = kbc;
     }
 
-    if (!any_fixup) {
+    if (!any_fixup && !dst_bf16) {
         return;
     }
 
@@ -1408,7 +1440,6 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
     if (!ids_dst) {
         const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst + it*I;
-        dst += offset_dst;
 
         const int i_max = nrows_x   - it*I - 1;
         const int j_max = ncols_dst - jt*J - 1;
@@ -1424,7 +1455,11 @@ static __global__ void mul_mat_q_stream_k_fixup(
                 return;
             }
 
-            dst[j*stride_col_dst + i] += sum[j0/nwarps];
+            if (dst_bf16) {
+                ((nv_bfloat16 *) dst_ptr)[offset_dst + j*stride_col_dst + i] = __float2bfloat16(sum[j0/nwarps]);
+            } else {
+                dst[offset_dst + j*stride_col_dst + i] += sum[j0/nwarps];
+            }
         }
         return;
     }
@@ -1440,7 +1475,6 @@ static __global__ void mul_mat_q_stream_k_fixup(
     __syncthreads();
 
     const int offset_dst = it*I;
-    dst += offset_dst;
 
     const int i_max = nrows_x  - it*I - 1;
     const int j_max = col_diff - jt*J - 1;
@@ -1456,12 +1490,17 @@ static __global__ void mul_mat_q_stream_k_fixup(
             return;
         }
 
-        dst[ids_dst_shared[j]*stride_col_dst + i] += sum[j0/nwarps];
+        const int idst = offset_dst + ids_dst_shared[j]*stride_col_dst + i;
+        if (dst_bf16) {
+            ((nv_bfloat16 *) dst_ptr)[idst] = __float2bfloat16(sum[j0/nwarps]);
+        } else {
+            dst[idst] += sum[j0/nwarps];
+        }
     }
 }
 
 struct mmq_args {
-    const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
+    const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; void * dst;
     const float * y_scale;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
@@ -1516,15 +1555,17 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    const bool dst_bf16 = args.fusion.dst_bf16;
+
     if (has_fusion || !config.stream_k) {
         GGML_ASSERT(nty <= 65535); // gridDim.y limit
         mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-            (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
+            (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
              (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, dst_bf16);
         return;
     }
 
@@ -1543,20 +1584,24 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
+    ggml_cuda_pool_alloc<float> tmp_first(pool); // BF16 dst: partial sums of the tiles started by previous blocks
     if (fixup_needed) {
         tmp_fixup.alloc(block_nums_stream_k.x * config.J*config.I);
+        if (dst_bf16) {
+            tmp_first.alloc(block_nums_stream_k.x * config.J*config.I);
+        }
     }
 
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
     mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
+        (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, tmp_first.ptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
          (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, dst_bf16);
 
     if (!fixup_needed) {
         return;
@@ -1564,9 +1609,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     CUDA_CHECK(cudaGetLastError());
     mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
-        (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+        (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, tmp_first.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, dst_bf16);
 }
 
 template <ggml_type type, bool fallback, ggml_prec prec_src1, bool has_fusion>

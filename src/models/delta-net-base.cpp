@@ -466,6 +466,11 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
+    // BF16 activations: the conv state is stored as F32
+    if (conv_states->type != qkv_mixed->type) {
+        conv_states = ggml_cast(ctx0, conv_states, qkv_mixed->type);
+    }
+
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 

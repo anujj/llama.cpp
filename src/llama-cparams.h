@@ -61,6 +61,9 @@ struct llama_cparams {
 
     size_t moe_cache_size;
 
+    ggml_type act_type;    // type of the activations between ops: F32 or BF16 (prototype, env LLAMA_ACT_TYPE)
+    bool      act_res_f32; // with BF16 activations: keep the residual stream in F32
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
 
