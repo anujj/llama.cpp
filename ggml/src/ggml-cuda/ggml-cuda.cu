@@ -2073,9 +2073,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
+    // MMVF reads F32 or BF16 src1 and writes F32 or BF16 dst
     bool use_mul_mat_vec_f =
         (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
-        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+        (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16) &&
+        (dst->type  == GGML_TYPE_F32 || dst->type  == GGML_TYPE_BF16);
 
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
@@ -3959,6 +3961,30 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
              mode == GGML_ROPE_TYPE_MROPE  || mode == GGML_ROPE_TYPE_IMROPE);
     }
 
+    std::initializer_list<enum ggml_op> cpy_concat_ops = { GGML_OP_CPY, GGML_OP_CONCAT };
+
+    // checked here, not with ggml_can_fuse: the concat is larger than the cast, and a cast is its own src[1]
+    if (is_equal(cpy_concat_ops, ops) && node_idx + 1 < cgraph->n_nodes) {
+        const ggml_tensor * cpy    = cgraph->nodes[node_idx];
+        const ggml_tensor * concat = cgraph->nodes[node_idx + 1];
+
+        if (cpy->op != GGML_OP_CPY || concat->op != GGML_OP_CONCAT || concat->src[0] != cpy || cpy->view_src ||
+                !(cpy->flags & GGML_TENSOR_FLAG_COMPUTE) || !(concat->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                ggml_node_get_use_count(cgraph, node_idx) != (cpy->src[1] == cpy ? 2 : 1)) {
+            return false;
+        }
+
+        // an F32 tensor cast to BF16 as src0 of a BF16 concat (BF16 activations: the F32 conv state)
+        const int32_t dim = ((const int32_t *) concat->op_params)[0];
+        const int out_nodes[] = { node_idx + 1 };
+        return concat->src[0] == cpy && cpy->src[0]->type == GGML_TYPE_F32 && cpy->type == GGML_TYPE_BF16 &&
+            concat->src[1]->type == GGML_TYPE_BF16 && concat->type == GGML_TYPE_BF16 && dim != 3 &&
+            ggml_are_same_shape(cpy, cpy->src[0]) && ggml_is_contiguous(cpy) &&
+            ggml_is_contiguous_to_3(cpy->src[0]) && ggml_is_contiguous_to_3(concat->src[1]) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 2, out_nodes, 1);
+    }
+
     std::initializer_list<enum ggml_op> rope_set_rows_ops = { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
     if (is_equal(rope_set_rows_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
@@ -4116,12 +4142,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
-        if (unary->type != mul->type) {
-            return false;
-        }
-
         const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
-        if (other->type != unary->type) {
+
+        // BF16 activations: a BF16 gate may scale an F32 tensor (F32 result)
+        const bool bf16_gate_f32 = unary->type == GGML_TYPE_BF16 && other->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32;
+        if (!bf16_gate_f32 && (unary->type != mul->type || other->type != unary->type)) {
             return false;
         }
         if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0]) || !ggml_are_same_shape(other, unary)) {
@@ -4345,6 +4370,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // RoPE + cast: a BF16 rope written as F32 (Q for flash attention)
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_CPY }, {})) {
         ggml_cuda_op_rope_fused_cpy(*cuda_ctx, cgraph->nodes[i], cgraph->nodes[i + 1]);
+        return 1;
+    }
+
+    // cast + concat: an F32 tensor cast to BF16 while concatenating (the conv state of the GDN layers)
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_CPY, GGML_OP_CONCAT }, {})) {
+        ggml_cuda_op_concat_cast(*cuda_ctx, cgraph->nodes[i], cgraph->nodes[i + 1]);
         return 1;
     }
 
@@ -4779,6 +4810,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
         for (const bool with_bias : { false, true }) {
+            // BF16 activations: the MoE weighted reduction applies the per-expert scale
+            // (the MMVQ with the fused scale is slower on GB10, same speed on RTX 5090)
+            if (op == GGML_OP_MUL_MAT_ID && cgraph->nodes[i]->op == op && cgraph->nodes[i]->type == GGML_TYPE_BF16) {
+                continue;
+            }
             const int n_ops = op == GGML_OP_MUL_MAT ? (with_bias ? 3 : 2) : (with_bias ? 6 : 5);
             const int out_nodes[] = { i + n_ops - 1 };
             ggml_op ops[6];
@@ -4898,6 +4934,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
+            continue;
+        }
+
+        // a BF16 bias (BF16 activations: the residual) is read with the layout of dst
+        if (bias_tensor->type != GGML_TYPE_F32 &&
+                (bias_tensor->type != GGML_TYPE_BF16 || ids || !ggml_are_same_layout(bias_tensor, bias_node))) {
             continue;
         }
 

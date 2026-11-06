@@ -468,6 +468,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     // BF16 activations: the conv state is stored as F32
     if (conv_states->type != qkv_mixed->type) {
+        // add the transpose first, so that the cast comes right before the concat (CUDA fuses the two)
+        ggml_build_forward_expand(gf, qkv_mixed);
         conv_states = ggml_cast(ctx0, conv_states, qkv_mixed->type);
     }
 

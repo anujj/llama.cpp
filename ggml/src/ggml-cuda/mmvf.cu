@@ -60,7 +60,8 @@ static __global__ void mul_mat_vec_f(
     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
     float glu_limit = 0.0f;
     const T * gate_x = nullptr;
-    const float * x_bias = nullptr;
+    const float * x_bias = nullptr; // nv_bfloat16 if fusion.x_bias_bf16
+    int64_t offset_bias = 0;
     const float * gate_bias = nullptr;
 
     if constexpr (has_fusion) {
@@ -91,7 +92,7 @@ static __global__ void mul_mat_vec_f(
     if constexpr (has_fusion) {
         const int channel_bias = ids ? channel_x : channel_dst;
         if (use_bias) {
-            x_bias += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
+            offset_bias = int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
         }
         if (use_gate_bias) {
             gate_bias += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
@@ -355,7 +356,8 @@ static __global__ void mul_mat_vec_f(
 
     if constexpr (has_fusion) {
         if (use_bias) {
-            value += x_bias[tid*stride_col_dst + row];
+            const int64_t ib = offset_bias + tid*stride_col_dst + row;
+            value += fusion.x_bias_bf16 ? __bfloat162float(((const nv_bfloat16 *) x_bias)[ib]) : x_bias[ib];
         }
 
         if (use_gate) {
@@ -386,7 +388,7 @@ static __global__ void mul_mat_vec_f(
     ggml_cuda_store_dst(dst, offset_dst + tid*stride_col_dst + row, value, fusion.dst_bf16);
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, gate_bias, sumf_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, offset_bias, gate_bias, sumf_gate);
     }
 }
 
@@ -668,14 +670,18 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     fusion_local.dst_bf16 = dst->type  == GGML_TYPE_BF16;
 
     if (fusion) {
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        // the biases are indexed with the strides of dst in elements
+        GGML_ASSERT(dst->type == GGML_TYPE_F32 || ggml_is_contiguous(dst));
         GGML_ASSERT( !ids || dst->ne[2] == 1);
         GGML_ASSERT(  ids || dst->ne[1] == 1);
         if (fusion->x_bias) {
-            GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
+            // a BF16 bias (dense only) is a residual with the layout of dst
+            GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32 ||
+                (fusion->x_bias->type == GGML_TYPE_BF16 && !ids && ggml_are_same_layout(fusion->x_bias, dst)));
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
-            fusion_local.x_bias = fusion->x_bias->data;
+            fusion_local.x_bias      = fusion->x_bias->data;
+            fusion_local.x_bias_bf16 = fusion->x_bias->type == GGML_TYPE_BF16;
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));

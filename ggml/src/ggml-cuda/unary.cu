@@ -303,8 +303,8 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 /* gated ops */
 
-template <float (*op)(float), typename T>
-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+template <float (*op)(float), typename T, typename T_g = T, typename T_dst = T>
+static __global__ void unary_gated_op_kernel(const T * x, const T_g * g, T_dst * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
@@ -317,14 +317,14 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
 
     ggml_cuda_pdl_sync();
-    dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[j0])) * ggml_cuda_cast<float>(g[j1]));
+    dst[i] = ggml_cuda_cast<T_dst>(op(ggml_cuda_cast<float>(x[j0])) * ggml_cuda_cast<float>(g[j1]));
 }
 
-template <float (*op)(float), typename T>
-static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
+template <float (*op)(float), typename T, typename T_g = T, typename T_dst = T>
+static void unary_gated_cuda(const T * x, const T_g * g, T_dst * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T, T_g, T_dst>, launch_params, x, g, dst, k, n, o0, o1);
 }
 
 template <float (*op)(float)>
@@ -720,8 +720,10 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     GGML_ASSERT(ggml_are_same_shape(unary_src, other_src));
 
     GGML_ASSERT(unary_src->type == GGML_TYPE_F32 || unary_src->type == GGML_TYPE_F16 || unary_src->type == GGML_TYPE_BF16);
-    GGML_ASSERT(unary_src->type == other_src->type);
-    GGML_ASSERT(unary_src->type == mul_node->type);
+    // BF16 activations: a BF16 gate may scale an F32 tensor (F32 result)
+    const bool bf16_gate_f32 = unary_src->type == GGML_TYPE_BF16 && other_src->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32;
+    GGML_ASSERT(bf16_gate_f32 || unary_src->type == other_src->type);
+    GGML_ASSERT(bf16_gate_f32 || unary_src->type == mul_node->type);
 
     cudaStream_t stream = ctx.stream();
 
@@ -730,7 +732,11 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     const int64_t unary_stride = unary_src->nb[1];
     const int64_t other_stride = other_src->nb[1];
 
-    if (unary_src->type == GGML_TYPE_F16) {
+    if (bf16_gate_f32) {
+        unary_gated_cuda<op>((const nv_bfloat16 *) unary_src->data, (const float *) other_src->data,
+                             (float *) mul_node->data, k, nc,
+                             unary_stride / sizeof(nv_bfloat16), other_stride / sizeof(float), stream);
+    } else if (unary_src->type == GGML_TYPE_F16) {
         unary_gated_cuda<op>((const half *) unary_src->data, (const half *) other_src->data,
                              (half *) mul_node->data, k, nc,
                              unary_stride / sizeof(half), other_stride / sizeof(half), stream);

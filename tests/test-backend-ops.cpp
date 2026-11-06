@@ -5444,6 +5444,143 @@ struct test_mul_mat_bf16_act : public test_case {
     }
 };
 
+// BF16 activations: MUL_MAT + ADD of a BF16 residual (fused into MMVF/MMVQ for one token on CUDA)
+struct test_mul_mat_add_bf16_act : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ADD_BF16";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
+                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT) &&
+                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+
+    test_mul_mat_add_bf16_act(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, k, n);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, m, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(r, "r");
+
+        ggml_tensor * mm = ggml_mul_mat_typed(ctx, a, b, GGML_TYPE_BF16);
+        ggml_set_name(mm, "mm");
+
+        ggml_tensor * out = ggml_add(ctx, mm, r);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// BF16 activations: UNARY of a BF16 gate times an F32 tensor, F32 result (fused on CUDA)
+struct test_unary_mul_bf16_gate : public test_case {
+    const ggml_unary_op op;
+    const std::array<int64_t, 4> ne;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return std::string(ggml_unary_op_name(op)) + "_MUL_BF16_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        // the fused kernel skips the BF16 rounding of the unary result
+        return 1e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_unary_mul_bf16_gate(ggml_unary_op op, std::array<int64_t, 4> ne)
+        : op(op), ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor(ctx, GGML_TYPE_BF16, 4, ne.data());
+        ggml_tensor * x    = ggml_new_tensor(ctx, GGML_TYPE_F32,  4, ne.data());
+        ggml_set_name(gate, "gate");
+        ggml_set_name(x, "x");
+
+        ggml_tensor * act = ggml_unary(ctx, gate, op);
+        ggml_set_name(act, "act");
+
+        ggml_tensor * out = ggml_mul(ctx, x, act);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// BF16 activations: an F32 tensor cast to BF16 and concatenated with a BF16 tensor (fused on CUDA)
+struct test_cast_concat_bf16 : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    const int64_t ne_b; // ne[dim] of b
+    const int dim;
+    const bool b_transposed; // b is a transposed view, as the conv input of the GDN layers
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CAST_CONCAT_BF16";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne_a, ne_b, dim, b_transposed);
+    }
+
+    test_cast_concat_bf16(std::array<int64_t, 4> ne_a, int64_t ne_b, int dim, bool b_transposed = false)
+        : ne_a(ne_a), ne_b(ne_b), dim(dim), b_transposed(b_transposed) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_set_name(a, "a");
+
+        std::array<int64_t, 4> ne = ne_a;
+        ne[dim] = ne_b;
+        ggml_tensor * b = nullptr;
+        if (b_transposed) {
+            ggml_tensor * bt = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, ne[1], ne[0], ne[2], ne[3]);
+            ggml_set_name(bt, "bt");
+            b = ggml_transpose(ctx, bt);
+        } else {
+            b = ggml_new_tensor(ctx, GGML_TYPE_BF16, 4, ne.data());
+        }
+        ggml_set_name(b, "b");
+
+        ggml_tensor * a_bf16 = ggml_cast(ctx, a, GGML_TYPE_BF16);
+        ggml_set_name(a_bf16, "a_bf16");
+
+        ggml_tensor * out = ggml_concat(ctx, a_bf16, b, dim);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // BF16 activations: ROPE of a BF16 tensor cast to F32 (Q for flash attention, fused on CUDA)
 struct test_rope_cast : public test_case {
     const std::array<int64_t, 4> ne;
@@ -13359,6 +13496,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // MUL_MAT + ADD of the residual: fused into MMVF (float weights) or MMVQ for one token
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4}) {
+        for (int64_t n : {1, 2}) {
+            test_cases.emplace_back(new test_mul_mat_add_bf16_act(type_a, 1024, n, 512));
+        }
+    }
+    // UNARY + MUL: a BF16 gate on the F32 attention output (qwen35 gated attention)
+    for (ggml_unary_op op : {GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU}) {
+        for (std::array<int64_t, 4> ne : { std::array<int64_t, 4>{4096, 1, 1, 1}, {128, 2, 2, 2}, {5, 7, 11, 13} }) {
+            test_cases.emplace_back(new test_unary_mul_bf16_gate(op, ne));
+        }
+    }
+    // cast + concat: the F32 conv state of the GDN layers joined to the BF16 conv input
+    test_cases.emplace_back(new test_cast_concat_bf16({3, 1024, 1, 1}, 1, 0));
+    test_cases.emplace_back(new test_cast_concat_bf16({3, 1024, 2, 1}, 1, 0));
+    test_cases.emplace_back(new test_cast_concat_bf16({3,   64, 4, 1}, 5, 0));
+    test_cases.emplace_back(new test_cast_concat_bf16({8,   16, 4, 1}, 3, 1));
+    test_cases.emplace_back(new test_cast_concat_bf16({3, 1024, 1, 1}, 1, 0, true));
+    test_cases.emplace_back(new test_cast_concat_bf16({3,  256, 1, 1}, 7, 0, true));
 
     // MUL_MAT_ID: n <= 8 MMVQ (MoE kernel for n > 1), larger n MMQ (n = 512: stream-k with fixup), float weights: generic path
     for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_BF16}) {
@@ -13388,6 +13544,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ffn_bf16_act(GGML_TYPE_NVFP4, 256, 6912, n_tokens, true));
         test_cases.emplace_back(new test_ffn_bf16_act(GGML_TYPE_NVFP4, 256, 6912, n_tokens, true, true));
         test_cases.emplace_back(new test_ffn_bf16_act(GGML_TYPE_Q4_K,  256, 6912, n_tokens, false));
+    }
+    // float weights: fused gate/up/GLU in MMVF for one token
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t n_tokens : {1, 4}) {
+            test_cases.emplace_back(new test_ffn_bf16_act(type, 256, 1024, n_tokens, false));
+        }
     }
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, false, false, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true,  false, GGML_TYPE_BF16));
